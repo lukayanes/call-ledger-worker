@@ -216,21 +216,36 @@ async function fetchGHLCallData(contactId, env) {
       for (const conv of conversations) {
         if (result.recordingUrl) break;
 
-        const msgResp = await fetch(
-          `${GHL_API_BASE}/conversations/${conv.id}/messages?limit=20`,
-          { headers }
-        );
+        // Paginate through messages to find the most recent recording
+        let lastMessageId = null;
+        const MAX_PAGES = 5; // Check up to 100 messages (5 pages x 20)
 
-        if (msgResp.ok) {
+        for (let page = 0; page < MAX_PAGES; page++) {
+          if (result.recordingUrl) break;
+
+          let msgUrl = `${GHL_API_BASE}/conversations/${conv.id}/messages?limit=20`;
+          if (lastMessageId) {
+            msgUrl += `&lastMessageId=${lastMessageId}`;
+          }
+
+          const msgResp = await fetch(msgUrl, { headers });
+
+          if (!msgResp.ok) {
+            const errText = await msgResp.text();
+            console.error("GHL messages error:", msgResp.status, errText.substring(0, 300));
+            break;
+          }
+
           const msgData = await msgResp.json();
-          console.log("GHL messages response keys:", Object.keys(msgData));
-          console.log("GHL messages raw (first 500):", JSON.stringify(msgData).substring(0, 500));
+          if (page === 0) {
+            console.log("GHL messages raw (first 500):", JSON.stringify(msgData).substring(0, 500));
+          }
 
           // GHL returns: { messages: { lastMessageId, nextPage, messages: [...] } }
-          // The messages array is double-nested under messages.messages
+          const msgContainer = msgData.messages || msgData;
           let messages = [];
-          if (msgData.messages && Array.isArray(msgData.messages.messages)) {
-            messages = msgData.messages.messages;
+          if (msgContainer && Array.isArray(msgContainer.messages)) {
+            messages = msgContainer.messages;
           } else if (Array.isArray(msgData.messages)) {
             messages = msgData.messages;
           } else if (Array.isArray(msgData.data)) {
@@ -239,7 +254,9 @@ async function fetchGHLCallData(contactId, env) {
             messages = msgData;
           }
 
-          console.log("Parsed messages count:", messages.length);
+          console.log(`Page ${page + 1}: ${messages.length} messages`);
+
+          if (messages.length === 0) break;
 
           for (const msg of messages) {
             if (!msg || typeof msg !== "object") continue;
@@ -250,7 +267,7 @@ async function fetchGHLCallData(contactId, env) {
               const url = typeof att === "string" ? att : (att.url || att.href || "");
               if (url && url.includes(".mp3")) {
                 result.recordingUrl = url;
-                console.log("Found recording in attachments:", url.substring(0, 100));
+                console.log("Found recording in attachments (page " + (page + 1) + "):", url.substring(0, 100));
                 break;
               }
             }
@@ -264,13 +281,16 @@ async function fetchGHLCallData(contactId, env) {
 
             if (recording) {
               result.recordingUrl = recording;
-              console.log("Found recording via field:", recording.substring(0, 100));
+              console.log("Found recording via field (page " + (page + 1) + "):", recording.substring(0, 100));
               break;
             }
           }
-        } else {
-          const errText = await msgResp.text();
-          console.error("GHL messages error:", msgResp.status, errText.substring(0, 300));
+
+          // Check if there are more pages
+          const hasNextPage = msgContainer.nextPage === true;
+          lastMessageId = msgContainer.lastMessageId || messages[messages.length - 1]?.id;
+
+          if (!hasNextPage || !lastMessageId) break;
         }
       }
     }
