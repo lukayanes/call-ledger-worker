@@ -18,7 +18,7 @@
 // ═══════════════════════════════════════════════════════════════════
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     // Handle CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
@@ -35,8 +35,10 @@ export default {
         const payload = await request.json();
         console.log("Webhook received:", JSON.stringify(payload).substring(0, 500));
 
-        const result = await processCall(payload, env);
-        return json(result);
+        // Respond to GHL immediately, then process in the background.
+        // This prevents GHL's 60-second webhook timeout on long calls.
+        ctx.waitUntil(processCall(payload, env));
+        return json({ status: "accepted", message: "Processing call in background" });
       } catch (err) {
         console.error("Worker error:", err.message, err.stack);
         return json({ status: "error", message: err.message }, 500);
