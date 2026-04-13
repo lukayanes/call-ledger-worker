@@ -188,23 +188,55 @@ async function fetchGHLCallData(contactId, env) {
 
         if (msgResp.ok) {
           const msgData = await msgResp.json();
-          const messages = msgData.messages || msgData.data || [];
+          console.log("GHL messages response keys:", Object.keys(msgData));
+          console.log("GHL messages raw (first 500):", JSON.stringify(msgData).substring(0, 500));
+
+          // Handle various response structures
+          let messages = [];
+          if (Array.isArray(msgData.messages)) {
+            messages = msgData.messages;
+          } else if (Array.isArray(msgData.data)) {
+            messages = msgData.data;
+          } else if (Array.isArray(msgData)) {
+            messages = msgData;
+          } else if (msgData.messages && typeof msgData.messages === "object") {
+            // Might be paginated or nested differently
+            messages = Object.values(msgData.messages);
+          }
+
+          console.log("Parsed messages count:", messages.length);
 
           for (const msg of messages) {
-            const msgType = (msg.type || msg.messageType || "").toLowerCase();
-            const isCall = msgType.includes("call") || !!msg.call || !!msg.callId;
+            if (!msg || typeof msg !== "object") continue;
 
-            if (isCall) {
-              const recording = msg.recordingUrl || msg.recording_url ||
-                               msg.meta?.recordingUrl || msg.attachments?.[0]?.url ||
-                               (msg.call && msg.call.recordingUrl) || "";
-              if (recording) {
-                result.recordingUrl = recording;
-                console.log("Found recording:", recording.substring(0, 80));
-                break;
-              }
+            const msgType = (msg.type || msg.messageType || msg.contentType || "").toLowerCase();
+            const msgBody = (msg.body || msg.message || msg.text || "").toLowerCase();
+            const isCall = msgType.includes("call") || !!msg.call || !!msg.callId ||
+                          msgBody.includes("call") || msgType.includes("audio");
+
+            // Also check for recording URLs in any field
+            const recording = msg.recordingUrl || msg.recording_url ||
+                             msg.meta?.recordingUrl || msg.meta?.recording_url ||
+                             msg.attachments?.[0]?.url ||
+                             (msg.call && msg.call.recordingUrl) ||
+                             msg.mediaUrl || msg.media_url || "";
+
+            // Check if any URL in the message looks like a recording
+            const bodyUrl = (msg.body || "").match(/(https:\/\/storage\.googleapis\.com\/[^\s"]+\.mp3)/);
+
+            if (recording) {
+              result.recordingUrl = recording;
+              console.log("Found recording via field:", recording.substring(0, 100));
+              break;
+            } else if (bodyUrl) {
+              result.recordingUrl = bodyUrl[1];
+              console.log("Found recording in message body:", bodyUrl[1].substring(0, 100));
+              break;
             }
           }
+        } else {
+          const errText = await msgResp.text();
+          console.error("GHL messages error:", msgResp.status, errText.substring(0, 300));
         }
       }
     }
