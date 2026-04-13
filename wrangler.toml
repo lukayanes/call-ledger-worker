@@ -1,0 +1,16 @@
+name = "call-ledger"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+LEDGER_SHEET_NAME = "Call Ledger"
+FIRST_DATA_ROW = "5"
+GOOGLE_SHEET_ID = "15vdxFzjzQXHLVatFQyaMSfSMMf4deRq6CURkY6FuQQM"
+GOOGLE_SERVICE_ACCOUNT_EMAIL = "ghl-call-leder@ghl-call-ledger.iam.gserviceaccount.com"
+
+# Secrets (set via dashboard or `wrangler secret put`):
+#   GHL_API_KEY
+#   GHL_LOCATION_ID
+#   ANTHROPIC_API_KEY
+#   OPENAI_API_KEY
+#   GOOGLE_PRIVATE_KEY
