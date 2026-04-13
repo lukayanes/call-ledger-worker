@@ -18,6 +18,7 @@
 // ═══════════════════════════════════════════════════════════════════
 
 export default {
+  // ── HTTP handler: receives GHL webhook and queues the job ──
   async fetch(request, env, ctx) {
     // Handle CORS preflight
     if (request.method === "OPTIONS") {
@@ -33,12 +34,11 @@ export default {
     if (request.method === "POST") {
       try {
         const payload = await request.json();
-        console.log("Webhook received:", JSON.stringify(payload).substring(0, 500));
+        console.log("Webhook received — queuing job:", JSON.stringify(payload).substring(0, 500));
 
-        // Respond to GHL immediately, then process in the background.
-        // This prevents GHL's 60-second webhook timeout on long calls.
-        ctx.waitUntil(processCall(payload, env));
-        return json({ status: "accepted", message: "Processing call in background" });
+        // Drop the job onto the queue — responds to GHL instantly
+        await env.CALL_QUEUE.send(payload);
+        return json({ status: "queued", message: "Call processing queued" });
       } catch (err) {
         console.error("Worker error:", err.message, err.stack);
         return json({ status: "error", message: err.message }, 500);
@@ -46,6 +46,23 @@ export default {
     }
 
     return json({ status: "error", message: "Method not allowed" }, 405);
+  },
+
+  // ── Queue consumer: processes calls with no time pressure ──
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      try {
+        const payload = message.body;
+        console.log("Processing queued call:", JSON.stringify(payload).substring(0, 300));
+
+        await processCall(payload, env);
+        message.ack();
+        console.log("Queue message processed and acknowledged");
+      } catch (err) {
+        console.error("Queue processing error:", err.message, err.stack);
+        message.retry();
+      }
+    }
   },
 };
 
