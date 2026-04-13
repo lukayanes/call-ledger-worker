@@ -2,6 +2,13 @@ name = "call-ledger"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
+[observability]
+enabled = true
+
+  [observability.logs]
+  invocation_logs = true
+  head_sampling_rate = 1
+
 [vars]
 LEDGER_SHEET_NAME = "Call Ledger"
 FIRST_DATA_ROW = "5"
