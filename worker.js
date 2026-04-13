@@ -89,6 +89,11 @@ async function processCall(payload, env) {
   // Step 5: Write to Google Sheet
   await writeToSheet(env, callData, transcript, aiExtracted);
 
+  // Step 6: Push call summary back to GHL contact notes
+  if (aiExtracted.call_summary && callData.contactId) {
+    await updateGHLContactNotes(callData.contactId, callData, aiExtracted, env);
+  }
+
   return { status: "success", seller: callData.sellerName, hasTranscript: !!transcript, hasSummary: !!aiExtracted.call_summary };
 }
 
@@ -106,7 +111,16 @@ function extractContactInfo(payload) {
   const firstName = contact.firstName || contact.first_name || contact.name || "";
   const lastName = contact.lastName || contact.last_name || "";
   const sellerName = (firstName + " " + lastName).trim() || "Unknown Seller";
-  const phone = contact.phone || contact.phoneNumber || contact.phone_number || "";
+  const rawPhone = contact.phone || contact.phoneNumber || contact.phone_number || "";
+  const phone = formatPhone(rawPhone);
+
+  // Address fields from webhook (GHL custom values)
+  const address1 = contact.address1 || contact.streetAddress || contact.street_address || "";
+  const city = contact.city || "";
+  const state = contact.state || "";
+  const postalCode = contact.postal_code || contact.postalCode || "";
+  const propertyAddress = address1;
+  const cityState = [city, state].filter(Boolean).join(", ") + (postalCode ? " " + postalCode : "");
 
   const callDate = payload.dateAdded || payload.date_added || payload.timestamp ||
                    contact.dateAdded || new Date().toISOString();
@@ -116,8 +130,8 @@ function extractContactInfo(payload) {
     sellerName,
     phone,
     callDate: new Date(callDate).toISOString(),
-    propertyAddress: "",
-    cityState: "",
+    propertyAddress,
+    cityState: cityState.trim(),
     askingPrice: "",
     propertyType: "",
     recordingUrl: "",
@@ -355,7 +369,7 @@ Return ONLY a valid JSON object with these exact keys:
 {
   "property_address": "",
   "city_state": "",
-  "asking_price": "",
+  "asking_price": "NUMBERS ONLY, no $ or commas. e.g. 250000 not $250,000. Convert words to numbers (e.g. 'a million' = 1000000)",
   "property_type": "SFR|Multi-Family|Commercial|Land|Mobile Home|Condo/Townhouse|Other",
   "motivation_level": "Hot|Warm|Cold|Not Interested",
   "call_summary": "2-3 sentence summary of the conversation — what was discussed, what the seller wants, and any key takeaways",
@@ -458,10 +472,8 @@ async function writeToSheet(env, callData, transcript, aiExtracted) {
   const nextSteps = aiExtracted.next_steps || "";
   const callbackDate = aiExtracted.callback_date || "";
 
-  // Parse asking price as number
-  let priceValue = askingPrice;
-  const priceNum = parseFloat(String(askingPrice).replace(/[$,]/g, ""));
-  if (!isNaN(priceNum)) priceValue = priceNum;
+  // Parse asking price — always output a clean number
+  let priceValue = parseAskingPrice(askingPrice);
 
   // Format the date
   const callDate = new Date(callData.callDate);
@@ -586,6 +598,118 @@ function base64url(input) {
     str = btoa(String.fromCharCode(...new Uint8Array(input)));
   }
   return str.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  GHL — Push call summary back to contact notes
+// ═══════════════════════════════════════════════════════════════════
+
+async function updateGHLContactNotes(contactId, callData, aiExtracted, env) {
+  try {
+    const headers = {
+      "Authorization": "Bearer " + env.GHL_API_KEY,
+      "Version": "2021-07-28",
+      "Content-Type": "application/json",
+    };
+
+    // First get existing notes so we don't overwrite them
+    const getResp = await fetch(`${GHL_API_BASE}/contacts/${contactId}`, { headers });
+    let existingNotes = "";
+    if (getResp.ok) {
+      const data = await getResp.json();
+      existingNotes = (data.contact || data).notes || "";
+    }
+
+    // Build the new note entry
+    const callDate = new Date(callData.callDate);
+    const dateStr = callDate.toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
+    const newNote = [
+      `--- Call Log: ${dateStr} ---`,
+      `Summary: ${aiExtracted.call_summary || "N/A"}`,
+      `Motivation: ${aiExtracted.motivation_level || "N/A"}`,
+      `Next Steps: ${aiExtracted.next_steps || "N/A"}`,
+      aiExtracted.callback_date ? `Callback: ${aiExtracted.callback_date}` : "",
+      "",
+    ].filter(Boolean).join("\n");
+
+    // Prepend new note to existing notes
+    const updatedNotes = newNote + (existingNotes ? "\n" + existingNotes : "");
+
+    const updateResp = await fetch(`${GHL_API_BASE}/contacts/${contactId}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ notes: updatedNotes }),
+    });
+
+    if (updateResp.ok) {
+      console.log("GHL contact notes updated for:", callData.sellerName);
+    } else {
+      const err = await updateResp.text();
+      console.error("GHL notes update error:", updateResp.status, err.substring(0, 300));
+    }
+  } catch (err) {
+    console.error("GHL notes update failed:", err.message);
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  PHONE FORMATTER — strips country code, formats as (XXX) XXX-XXXX
+// ═══════════════════════════════════════════════════════════════════
+
+function formatPhone(raw) {
+  if (!raw) return "";
+  // Strip everything except digits
+  let digits = raw.replace(/\D/g, "");
+  // Remove leading 1 (US country code) if 11 digits
+  if (digits.length === 11 && digits.startsWith("1")) {
+    digits = digits.substring(1);
+  }
+  // Format as (XXX) XXX-XXXX
+  if (digits.length === 10) {
+    return `(${digits.substring(0, 3)}) ${digits.substring(3, 6)}-${digits.substring(6)}`;
+  }
+  return raw; // Return original if not a standard US number
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  ASKING PRICE PARSER — always returns a clean number
+// ═══════════════════════════════════════════════════════════════════
+
+function parseAskingPrice(raw) {
+  if (!raw) return "";
+  const str = String(raw).trim();
+
+  // Try direct numeric parse (handles "$1,000,000", "250000", etc.)
+  const cleaned = str.replace(/[$,\s]/g, "");
+  const direct = parseFloat(cleaned);
+  if (!isNaN(direct) && direct > 0) return direct;
+
+  // Handle word-based amounts
+  const lower = str.toLowerCase();
+  const multipliers = {
+    "million": 1000000, "mil": 1000000, "m": 1000000,
+    "thousand": 1000, "k": 1000,
+    "hundred thousand": 100000,
+  };
+
+  // Match patterns like "a million", "1.5 million", "500 thousand", "500k"
+  for (const [word, mult] of Object.entries(multipliers)) {
+    const regex = new RegExp(`([\\d.]+)?\\s*${word}`, "i");
+    const match = lower.match(regex);
+    if (match) {
+      const num = match[1] ? parseFloat(match[1]) : 1;
+      return num * mult;
+    }
+  }
+
+  // Check for just "a million" / "a hundred thousand" etc.
+  if (lower.includes("million")) return 1000000;
+  if (lower.includes("hundred thousand")) return 100000;
+
+  return str; // Return as-is if we can't parse it
 }
 
 
