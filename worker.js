@@ -112,7 +112,9 @@ function extractContactInfo(payload) {
   const lastName = contact.lastName || contact.last_name || "";
   const sellerName = (firstName + " " + lastName).trim() || "Unknown Seller";
   const rawPhone = contact.phone || contact.phoneNumber || contact.phone_number || "";
+  console.log("Raw phone from webhook:", rawPhone);
   const phone = formatPhone(rawPhone);
+  console.log("Formatted phone:", phone);
 
   // Address fields from webhook (GHL custom values)
   const address1 = contact.address1 || contact.streetAddress || contact.street_address || "";
@@ -164,7 +166,7 @@ async function fetchGHLCallData(contactId, env) {
       const c = data.contact || data;
 
       result.sellerName = ((c.firstName || "") + " " + (c.lastName || "")).trim();
-      result.phone = c.phone || "";
+      result.phone = formatPhone(c.phone || "");
 
       const cf = c.customFields || c.customField || [];
       result.propertyAddress = getCustomField(cf, ["property_address", "address", "Property Address"]);
@@ -613,43 +615,33 @@ async function updateGHLContactNotes(contactId, callData, aiExtracted, env) {
       "Content-Type": "application/json",
     };
 
-    // First get existing notes so we don't overwrite them
-    const getResp = await fetch(`${GHL_API_BASE}/contacts/${contactId}`, { headers });
-    let existingNotes = "";
-    if (getResp.ok) {
-      const data = await getResp.json();
-      existingNotes = (data.contact || data).notes || "";
-    }
-
-    // Build the new note entry
+    // Build the note body
     const callDate = new Date(callData.callDate);
     const dateStr = callDate.toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
-    const newNote = [
-      `--- Call Log: ${dateStr} ---`,
+    const noteBody = [
       `Summary: ${aiExtracted.call_summary || "N/A"}`,
       `Motivation: ${aiExtracted.motivation_level || "N/A"}`,
       `Next Steps: ${aiExtracted.next_steps || "N/A"}`,
       aiExtracted.callback_date ? `Callback: ${aiExtracted.callback_date}` : "",
-      "",
     ].filter(Boolean).join("\n");
 
-    // Prepend new note to existing notes
-    const updatedNotes = newNote + (existingNotes ? "\n" + existingNotes : "");
-
-    const updateResp = await fetch(`${GHL_API_BASE}/contacts/${contactId}`, {
-      method: "PUT",
+    // Use the dedicated Notes API endpoint: POST /contacts/{id}/notes
+    const noteResp = await fetch(`${GHL_API_BASE}/contacts/${contactId}/notes`, {
+      method: "POST",
       headers,
-      body: JSON.stringify({ notes: updatedNotes }),
+      body: JSON.stringify({
+        body: noteBody,
+      }),
     });
 
-    if (updateResp.ok) {
-      console.log("GHL contact notes updated for:", callData.sellerName);
+    if (noteResp.ok) {
+      console.log("GHL note created for:", callData.sellerName);
     } else {
-      const err = await updateResp.text();
-      console.error("GHL notes update error:", updateResp.status, err.substring(0, 300));
+      const err = await noteResp.text();
+      console.error("GHL note creation error:", noteResp.status, err.substring(0, 300));
     }
   } catch (err) {
-    console.error("GHL notes update failed:", err.message);
+    console.error("GHL note creation failed:", err.message);
   }
 }
 
