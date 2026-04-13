@@ -191,17 +191,17 @@ async function fetchGHLCallData(contactId, env) {
           console.log("GHL messages response keys:", Object.keys(msgData));
           console.log("GHL messages raw (first 500):", JSON.stringify(msgData).substring(0, 500));
 
-          // Handle various response structures
+          // GHL returns: { messages: { lastMessageId, nextPage, messages: [...] } }
+          // The messages array is double-nested under messages.messages
           let messages = [];
-          if (Array.isArray(msgData.messages)) {
+          if (msgData.messages && Array.isArray(msgData.messages.messages)) {
+            messages = msgData.messages.messages;
+          } else if (Array.isArray(msgData.messages)) {
             messages = msgData.messages;
           } else if (Array.isArray(msgData.data)) {
             messages = msgData.data;
           } else if (Array.isArray(msgData)) {
             messages = msgData;
-          } else if (msgData.messages && typeof msgData.messages === "object") {
-            // Might be paginated or nested differently
-            messages = Object.values(msgData.messages);
           }
 
           console.log("Parsed messages count:", messages.length);
@@ -209,28 +209,27 @@ async function fetchGHLCallData(contactId, env) {
           for (const msg of messages) {
             if (!msg || typeof msg !== "object") continue;
 
-            const msgType = (msg.type || msg.messageType || msg.contentType || "").toLowerCase();
-            const msgBody = (msg.body || msg.message || msg.text || "").toLowerCase();
-            const isCall = msgType.includes("call") || !!msg.call || !!msg.callId ||
-                          msgBody.includes("call") || msgType.includes("audio");
+            // Check attachments array — GHL puts recording URLs here as strings
+            const attachments = msg.attachments || [];
+            for (const att of attachments) {
+              const url = typeof att === "string" ? att : (att.url || att.href || "");
+              if (url && url.includes(".mp3")) {
+                result.recordingUrl = url;
+                console.log("Found recording in attachments:", url.substring(0, 100));
+                break;
+              }
+            }
+            if (result.recordingUrl) break;
 
-            // Also check for recording URLs in any field
+            // Also check dedicated recording fields
             const recording = msg.recordingUrl || msg.recording_url ||
                              msg.meta?.recordingUrl || msg.meta?.recording_url ||
-                             msg.attachments?.[0]?.url ||
                              (msg.call && msg.call.recordingUrl) ||
                              msg.mediaUrl || msg.media_url || "";
-
-            // Check if any URL in the message looks like a recording
-            const bodyUrl = (msg.body || "").match(/(https:\/\/storage\.googleapis\.com\/[^\s"]+\.mp3)/);
 
             if (recording) {
               result.recordingUrl = recording;
               console.log("Found recording via field:", recording.substring(0, 100));
-              break;
-            } else if (bodyUrl) {
-              result.recordingUrl = bodyUrl[1];
-              console.log("Found recording in message body:", bodyUrl[1].substring(0, 100));
               break;
             }
           }
