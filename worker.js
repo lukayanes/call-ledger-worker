@@ -15,6 +15,15 @@
 //  Environment variables (non-secret, set in dashboard or wrangler.toml):
 //    LEDGER_SHEET_NAME   — Default: "Call Ledger"
 //    FIRST_DATA_ROW      — Default: 5
+//
+//  Sheet columns (Call Ledger tab):
+//    A: auto-number formula | B–L: call data | M: Outcome (manual) | N: Recording URL (auto)
+//
+//  NOTE — Capturing prior calls:
+//    The worker collects EVERY recording on the contact's conversations (newest-first)
+//    and picks the newest one NOT already logged in column N. So if the most recent
+//    call is already in the ledger and you re-trigger the webhook, the worker will
+//    capture the previous call automatically.
 // ═══════════════════════════════════════════════════════════════════
 
 export default {
@@ -82,10 +91,29 @@ async function processCall(payload, env) {
     return { status: "partial", reason: "No contact ID for API lookup", seller: contactInfo.sellerName };
   }
 
-  // Step 2: Fetch full contact details + recording URL from GHL API
+  // Step 2: Fetch full contact details + ALL recording URLs from GHL API
   const ghlData = await fetchGHLCallData(contactInfo.contactId, env);
   const callData = mergeCallData(contactInfo, ghlData);
-  console.log("Merged call data:", JSON.stringify({ ...callData, recordingUrl: callData.recordingUrl ? "FOUND" : "NONE" }));
+  console.log(`Found ${callData.allRecordingUrls.length} total recording(s) for this contact`);
+
+  // Step 2b: Pick the newest recording that hasn't been logged to the sheet yet.
+  // This is what lets you re-trigger the webhook to capture an EARLIER call:
+  //   - newest call already in the ledger? → grab the one before it
+  //   - all recordings already in ledger?  → skip (nothing to do)
+  if (callData.allRecordingUrls.length > 0) {
+    const processed = await getProcessedRecordingUrls(env);
+    const unprocessed = callData.allRecordingUrls.filter(
+      u => !processed.has(normalizeRecordingUrl(u))
+    );
+    console.log(`${unprocessed.length} recording(s) not yet in the ledger`);
+
+    if (unprocessed.length === 0) {
+      console.log("All recordings for this contact are already in the ledger — nothing to do");
+      return { status: "skipped", reason: "All recordings already processed", seller: callData.sellerName };
+    }
+    callData.recordingUrl = unprocessed[0]; // newest unprocessed
+  }
+  console.log("Selected recording:", callData.recordingUrl ? "FOUND" : "NONE");
 
   // Step 3: Transcribe recording with Whisper
   let transcript = "";
@@ -117,7 +145,7 @@ async function processCall(payload, env) {
     console.log("AI extracted:", JSON.stringify(aiExtracted));
   }
 
-  // Step 6: Write to Call Ledger sheet
+  // Step 6: Write to Call Ledger sheet (also stamps recording URL in column N)
   await writeToSheet(env, callData, transcript, aiExtracted);
 
   // Step 7: Write structured data to Intelligence DB tab
@@ -177,12 +205,13 @@ function extractContactInfo(payload) {
     askingPrice: "",
     propertyType: "",
     recordingUrl: "",
+    allRecordingUrls: [],
   };
 }
 
 
 // ═══════════════════════════════════════════════════════════════════
-//  GHL API — Fetch contact + recording
+//  GHL API — Fetch contact + ALL recordings (newest-first)
 // ═══════════════════════════════════════════════════════════════════
 
 const GHL_API_BASE = "https://services.leadconnectorhq.com";
@@ -191,6 +220,7 @@ async function fetchGHLCallData(contactId, env) {
   const result = {
     sellerName: "", phone: "", propertyAddress: "", cityState: "",
     askingPrice: "", propertyType: "", recordingUrl: "",
+    allRecordingUrls: [], // newest-first list of every recording found
   };
 
   const headers = {
@@ -223,7 +253,7 @@ async function fetchGHLCallData(contactId, env) {
     console.error("GHL contact fetch failed:", err.message);
   }
 
-  // 2. Search conversations for recording URL
+  // 2. Search conversations for ALL recording URLs
   try {
     const convResp = await fetch(
       `${GHL_API_BASE}/conversations/search?contactId=${contactId}&locationId=${env.GHL_LOCATION_ID}`,
@@ -235,15 +265,11 @@ async function fetchGHLCallData(contactId, env) {
       const conversations = convData.conversations || [];
 
       for (const conv of conversations) {
-        if (result.recordingUrl) break;
-
-        // Paginate through messages to find the most recent recording
+        // Paginate through ALL messages — don't stop at the first recording.
         let lastMessageId = null;
         const MAX_PAGES = 5; // Check up to 100 messages (5 pages x 20)
 
         for (let page = 0; page < MAX_PAGES; page++) {
-          if (result.recordingUrl) break;
-
           let msgUrl = `${GHL_API_BASE}/conversations/${conv.id}/messages?limit=20`;
           if (lastMessageId) {
             msgUrl += `&lastMessageId=${lastMessageId}`;
@@ -282,28 +308,35 @@ async function fetchGHLCallData(contactId, env) {
           for (const msg of messages) {
             if (!msg || typeof msg !== "object") continue;
 
-            // Check attachments array — GHL puts recording URLs here as strings
+            // Find at most one recording URL per message (attachments first, then dedicated fields).
+            let foundUrl = "";
+
             const attachments = msg.attachments || [];
             for (const att of attachments) {
               const url = typeof att === "string" ? att : (att.url || att.href || "");
               if (url && url.includes(".mp3")) {
-                result.recordingUrl = url;
-                console.log("Found recording in attachments (page " + (page + 1) + "):", url.substring(0, 100));
+                foundUrl = url;
                 break;
               }
             }
-            if (result.recordingUrl) break;
 
-            // Also check dedicated recording fields
-            const recording = msg.recordingUrl || msg.recording_url ||
-                             msg.meta?.recordingUrl || msg.meta?.recording_url ||
-                             (msg.call && msg.call.recordingUrl) ||
-                             msg.mediaUrl || msg.media_url || "";
+            if (!foundUrl) {
+              foundUrl = msg.recordingUrl || msg.recording_url ||
+                         msg.meta?.recordingUrl || msg.meta?.recording_url ||
+                         (msg.call && msg.call.recordingUrl) ||
+                         msg.mediaUrl || msg.media_url || "";
+            }
 
-            if (recording) {
-              result.recordingUrl = recording;
-              console.log("Found recording via field (page " + (page + 1) + "):", recording.substring(0, 100));
-              break;
+            if (foundUrl) {
+              // De-dupe via normalized URL (strips signed-URL query params)
+              const norm = normalizeRecordingUrl(foundUrl);
+              const alreadyHave = result.allRecordingUrls.some(
+                u => normalizeRecordingUrl(u) === norm
+              );
+              if (!alreadyHave) {
+                result.allRecordingUrls.push(foundUrl);
+                console.log(`Found recording #${result.allRecordingUrls.length} (page ${page + 1}):`, foundUrl.substring(0, 100));
+              }
             }
           }
 
@@ -315,6 +348,9 @@ async function fetchGHLCallData(contactId, env) {
         }
       }
     }
+
+    // Default selection = newest. processCall will override with the newest unprocessed.
+    result.recordingUrl = result.allRecordingUrls[0] || "";
 
     if (!result.recordingUrl) {
       console.log("No recording URL found in GHL conversations");
@@ -358,7 +394,55 @@ function mergeCallData(webhookData, apiData) {
     askingPrice: apiData.askingPrice || webhookData.askingPrice,
     propertyType: apiData.propertyType || webhookData.propertyType,
     recordingUrl: apiData.recordingUrl || webhookData.recordingUrl,
+    allRecordingUrls: apiData.allRecordingUrls || [],
   };
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  RECORDING URL HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+// Strip query params so signed-URL signatures don't break de-dupe / processed checks.
+function normalizeRecordingUrl(url) {
+  if (!url) return "";
+  return String(url).split("?")[0].trim();
+}
+
+// Read column N of the Call Ledger to find every recording URL we've already logged.
+// Returns a Set of normalized URLs.
+async function getProcessedRecordingUrls(env) {
+  try {
+    const accessToken = await getGoogleAccessToken(env);
+    if (!accessToken) return new Set();
+
+    const sheetId = env.GOOGLE_SHEET_ID;
+    const sheetName = env.LEDGER_SHEET_NAME || "Call Ledger";
+    const firstDataRow = parseInt(env.FIRST_DATA_ROW || "5");
+
+    const resp = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetName)}!N${firstDataRow}:N1000`,
+      { headers: { "Authorization": "Bearer " + accessToken } }
+    );
+
+    if (!resp.ok) {
+      console.error("Failed to read processed URLs:", resp.status);
+      return new Set();
+    }
+
+    const data = await resp.json();
+    const values = data.values || [];
+    const urls = values
+      .map(row => (row && row[0]) || "")
+      .filter(Boolean)
+      .map(normalizeRecordingUrl);
+
+    console.log(`Loaded ${urls.length} previously-processed recording URL(s)`);
+    return new Set(urls);
+  } catch (err) {
+    console.error("getProcessedRecordingUrls failed:", err.message);
+    return new Set();
+  }
 }
 
 
@@ -692,7 +776,7 @@ async function writeToSheet(env, callData, transcript, aiExtracted) {
   const callDate = new Date(callData.callDate);
   const dateStr = `${(callDate.getMonth() + 1).toString().padStart(2, "0")}/${callDate.getDate().toString().padStart(2, "0")}/${callDate.getFullYear()}`;
 
-  // Write row: B through L (A has auto-number formula)
+  // Write row: B through L (A has auto-number formula; M is manual Outcome; N is recording URL)
   const rowValues = [
     dateStr,              // B: Date
     callData.sellerName,  // C: Seller Name
@@ -725,6 +809,27 @@ async function writeToSheet(env, callData, transcript, aiExtracted) {
   } else {
     const err = await writeResp.text();
     console.error("Sheets write error:", err);
+  }
+
+  // Stamp the recording URL into column N — separate write so we don't touch column M (manual Outcome).
+  // This is the fingerprint that future runs use to detect already-processed calls.
+  if (callData.recordingUrl) {
+    const urlRange = `${sheetName}!N${nextRow}`;
+    const urlResp = await fetch(
+      `${baseUrl}/values/${encodeURIComponent(urlRange)}?valueInputOption=USER_ENTERED`,
+      {
+        method: "PUT",
+        headers: {
+          "Authorization": "Bearer " + accessToken,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ values: [[normalizeRecordingUrl(callData.recordingUrl)]] }),
+      }
+    );
+    if (!urlResp.ok) {
+      const err = await urlResp.text();
+      console.error("Sheets recording URL write error:", err);
+    }
   }
 }
 
