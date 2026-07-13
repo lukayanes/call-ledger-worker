@@ -69,9 +69,19 @@ export default {
   async queue(batch, env) {
     for (const message of batch.messages) {
       try {
-        await processCall(message.body, env);
-        message.ack();
-        console.log("Queue message processed and acknowledged");
+        const payload = message.body || {};
+        const attempt = payload.__attempt || 1;
+        const result = await processCall(payload, env, attempt);
+        if (result && result.retry) {
+          // Recording not ready yet — re-queue with a delay so GHL has time to
+          // attach it. Self-managed (doesn't depend on queue max_retries config).
+          await env.CALL_QUEUE.send({ ...payload, __attempt: attempt + 1 }, { delaySeconds: 60 });
+          message.ack();
+          console.log(`Recording not ready — re-queued for attempt ${attempt + 1} in 60s`);
+        } else {
+          message.ack();
+          console.log("Queue message processed and acknowledged");
+        }
       } catch (err) {
         console.error("Queue processing error:", err.message, err.stack);
         message.retry();
@@ -85,10 +95,11 @@ export default {
 //  MAIN PIPELINE
 // ═══════════════════════════════════════════════════════════════════
 
-const BUILD_VERSION = "v3-recording-endpoint";
+const BUILD_VERSION = "v4-retry-on-not-ready";
+const MAX_ATTEMPTS = 5; // GHL attaches call recordings up to ~1 min after the call ends
 
-async function processCall(payload, env) {
-  console.log(`>>> BUILD ${BUILD_VERSION} <<<`);
+async function processCall(payload, env, attempts = 1) {
+  console.log(`>>> BUILD ${BUILD_VERSION} <<< (attempt ${attempts})`);
   const contactInfo = extractContactInfo(payload);
   console.log("Contact info:", JSON.stringify(contactInfo));
 
@@ -102,33 +113,46 @@ async function processCall(payload, env) {
   const callData = mergeCallData(contactInfo, ghlData);
   console.log(`Found ${callData.allRecordingUrls.length} total recording(s) for this contact`);
 
-  // Pick the newest recording not already in the ledger.
+  // Which recordings haven't been logged yet?
+  let candidates = [];
   if (callData.allRecordingUrls.length > 0) {
     const processed = await getProcessedRecordingUrls(env);
-    const unprocessed = callData.allRecordingUrls.filter(
+    candidates = callData.allRecordingUrls.filter(
       u => !processed.has(normalizeRecordingUrl(u))
     );
-    console.log(`${unprocessed.length} recording(s) not yet in the ledger`);
-    if (unprocessed.length === 0) {
+    console.log(`${candidates.length} recording(s) not yet in the ledger`);
+    if (candidates.length === 0) {
       console.log("All recordings already in the ledger — nothing to do");
       return { status: "skipped", reason: "All recordings already processed", seller: callData.sellerName };
     }
-    callData.recordingUrl = unprocessed[0];
   }
-  console.log("Selected recording:", callData.recordingUrl ? "FOUND" : "NONE");
 
-  // Transcribe
+  // Transcribe — try each candidate until one works.
   let transcript = "";
   let recDiag = "";
-  if (callData.recordingUrl) {
-    console.log("Transcribing recording...");
-    const r = await transcribeRecording(callData.recordingUrl, env);
-    transcript = r.text;
-    recDiag = r.diag;
-    console.log("Transcript length:", transcript.length, recDiag ? `| diag: ${recDiag}` : "");
+  let notReady = false;
+  if (candidates.length > 0) {
+    for (const cand of candidates) {
+      console.log("Transcribing recording...");
+      const r = await transcribeRecording(cand, env);
+      callData.recordingUrl = cand;
+      if (r.text) { transcript = r.text; recDiag = ""; notReady = false; break; }
+      recDiag = r.diag;
+      notReady = r.notReady;
+      console.log("Transcript length: 0 | diag:", recDiag);
+    }
+    if (transcript) console.log("Transcript length:", transcript.length);
   } else {
-    recDiag = "No call recording found in GHL for this contact (checked conversation messages).";
+    recDiag = "No call recording found yet in GHL for this contact.";
+    notReady = true;
     console.log(recDiag);
+  }
+
+  // GHL attaches recordings up to ~1 min after a call ends. If it's not ready
+  // yet, defer and let the queue re-deliver after a delay (don't write a blank row).
+  if (!transcript && notReady && attempts < MAX_ATTEMPTS) {
+    console.log(`Recording not ready (attempt ${attempts}/${MAX_ATTEMPTS}) — deferring for retry`);
+    return { retry: true, reason: "recording-not-ready", seller: callData.sellerName };
   }
 
   // Extract with Claude — or, if we couldn't transcribe, surface WHY in the sheet.
@@ -448,7 +472,10 @@ async function transcribeRecording(recordingUrl, env) {
       const body = (await audioResp.text().catch(() => "")).substring(0, 160);
       const diag = `Recording download failed: HTTP ${audioResp.status}${body ? " — " + body : ""}`;
       console.error(diag);
-      return { text: "", diag };
+      const s = audioResp.status;
+      // 422 = "message does not have recording yet"; 404/408/429/5xx = transient.
+      const notReady = s === 422 || s === 404 || s === 408 || s === 425 || s === 429 || s >= 500;
+      return { text: "", diag, notReady };
     }
 
     // The endpoint may return the audio directly, OR a JSON wrapper with a link.
@@ -462,13 +489,13 @@ async function transcribeRecording(recordingUrl, env) {
       if (!link) {
         const diag = `Recording endpoint returned JSON without a URL: ${JSON.stringify(j).substring(0, 160)}`;
         console.error(diag);
-        return { text: "", diag };
+        return { text: "", diag, notReady: false };
       }
       const linkResp = await fetch(link);
       if (!linkResp.ok) {
         const diag = `Recording link fetch failed: HTTP ${linkResp.status}`;
         console.error(diag);
-        return { text: "", diag };
+        return { text: "", diag, notReady: true };
       }
       contentType = (linkResp.headers.get("content-type") || "audio/mpeg").toLowerCase();
       audioBuffer = await linkResp.arrayBuffer();
@@ -480,14 +507,14 @@ async function transcribeRecording(recordingUrl, env) {
     console.log(`Recording size: ${sizeMB.toFixed(2)}MB, type: ${contentType || "unknown"}`);
 
     if (audioBuffer.byteLength < 1024) {
-      const diag = `Recording was empty (${audioBuffer.byteLength} bytes) — may not be ready yet; re-trigger to retry.`;
+      const diag = `Recording was empty (${audioBuffer.byteLength} bytes) — not ready yet.`;
       console.error(diag);
-      return { text: "", diag };
+      return { text: "", diag, notReady: true };
     }
     if (sizeMB > 25) {
       const diag = `Recording too large for Whisper (${sizeMB.toFixed(1)}MB > 25MB limit).`;
       console.error(diag);
-      return { text: "", diag };
+      return { text: "", diag, notReady: false };
     }
 
     let ext = "mp3";
@@ -514,16 +541,16 @@ async function transcribeRecording(recordingUrl, env) {
     if (resp.ok) {
       const transcript = await resp.text();
       console.log("Whisper done:", transcript.substring(0, 150) + "...");
-      return { text: transcript, diag: "" };
+      return { text: transcript, diag: "", notReady: false };
     }
     const err = (await resp.text()).substring(0, 200);
     const diag = `Whisper transcription error: ${err}`;
     console.error(diag);
-    return { text: "", diag };
+    return { text: "", diag, notReady: false };
   } catch (err) {
     const diag = `Transcription exception: ${err.message}`;
     console.error(diag);
-    return { text: "", diag };
+    return { text: "", diag, notReady: true };
   }
 }
 
