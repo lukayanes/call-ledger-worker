@@ -58,7 +58,7 @@ export default {
 };
 
 
-const BUILD_VERSION = "v5-model-fix";
+const BUILD_VERSION = "v6-claude-parse-fix";
 const MAX_ATTEMPTS = 5;
 
 async function processCall(payload, env, attempts = 1) {
@@ -476,9 +476,15 @@ ${transcript}`;
     });
     if (resp.ok) {
       const result = await resp.json();
-      const text = result.content[0].text;
+      const blocks = Array.isArray(result.content) ? result.content : [];
+      const text = blocks.map(b => (b && typeof b.text === "string" ? b.text : "")).join("").trim();
+      if (!text) {
+        console.error("Claude returned no text block. Raw:", JSON.stringify(result).substring(0, 300));
+        return {};
+      }
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (jsonMatch) return JSON.parse(jsonMatch[0]);
+      console.error("Claude response had no JSON object:", text.substring(0, 200));
     } else {
       console.error("Claude error:", (await resp.text()).substring(0, 300));
     }
